@@ -86,7 +86,8 @@ from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconne
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import abuse, action_gate, anger, call_end, early_lid, slot_grouping, topic_flow
+from agent import abuse, action_gate, anger, call_end, date_check, early_lid, earliest_request
+from agent import slot_grouping, topic_flow
 from agent import entity_confirmation as entity_text
 from agent import history_templates as history_text
 from agent import messages as agent_messages
@@ -105,6 +106,10 @@ from agent.booking_flow import (
     classify_yes_no,
     correction_acknowledgement,
     effective_phone,
+    merge_digits,
+    normalise_phone,
+    phone_digits_so_far,
+    pick_offered_slot,
     is_ready_to_confirm,
     mark_awaiting_charge_confirm,
     mark_confirming,
@@ -203,7 +208,13 @@ from agent.reply_templates import (
     doctor_availability_reply,
     insufficient_information_reply,
     lookup_reply,
+    date_ask_prompt,
+    date_check_prompt,
+    doctor_offer_prompt,
+    earliest_none_prompt,
+    earliest_slots_prompt,
     missing_slot_prompt,
+    phone_continue_prompt,
     multi_test_reply,
     multiple_bookings_reply,
     reschedule_reply,
@@ -1070,6 +1081,12 @@ class CallSession:
         self.pending_enquiry = None  # (intent, turn) when we just asked "which test / which doctor"
         self.last_enquiry_turn = 0  # turn_count when the last test/doctor answer was given (agent/enquiry_followup.py)
         self.no_at_confirm = False  # the caller said "no, ..." at the confirmation step and it was not a bare no
+        # "Patient name is misheard": a name captured on a turn nothing vouches for is read back
+        # at once, before four more questions are answered under it.
+        self.awaiting_name_confirm = False
+        # "Caller says tomorrow, day after, or next Monday": the enquiry waiting on a date the
+        # caller has yet to confirm, as (intent, slots, date).
+        self.pending_dated_enquiry: tuple | None = None
         # KCD-499: stored preferences, offered after the answer and applied only if the caller says yes.
         self.pending_pref = None
         self.awaiting_pref_answer = False
@@ -2626,6 +2643,10 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str, early: early_
         # LLM round trip, both for the zero-extra-latency requirement and
         # because CLAUDE.md's truth boundary keeps exactly this kind of
         # high-stakes binary decision out of the model's hands.
+        if session.pending_dated_enquiry and await _continue_dated_enquiry(session, text, lang):
+            return
+        if session.awaiting_name_confirm and await _continue_name_confirm(session, text, lang):
+            return
         if session.awaiting_resume and await _continue_resume_offer(session, text, lang):
             return
         if session.booking is not None and session.booking.stage in ("confirming", "awaiting_charge_confirm"):
@@ -2800,6 +2821,10 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str, early: early_
 
             elif intent == "doctor_availability":
                 slots, _ = _followup(session, intent, slots, text, lang)
+                if slots.get("doctor_name") and await _confirm_spoken_date(
+                    session, intent, slots, text, lang
+                ):
+                    return
                 reply = await _answer_enquiry_intent(intent, slots, lang)
                 if reply is None:
                     session.pending_enquiry = (intent, session.turn_count)
@@ -2825,8 +2850,16 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str, early: early_
                     return
                 await _finish_enquiry_turn(session, text, lang, intent, slots, reply, data)
 
+            # story: "Caller gives everything in one sentence" -- every slot this turn
+            # carried is merged into what earlier turns gave (agent/booking_flow.merge_slots),
+            # so a complete opening sentence falls straight through to the readback.
             elif intent == "book_appointment":
                 st = _enter_task(session, "book_appointment")
+                _absorb_phone_digits(st, slots)
+                # An answer to a slot offer ("প্রথমটা", "10:15", "হ্যাঁ") fills the day and time
+                # before the model's own slots are merged, so a bare "yes" is not lost.
+                if not slots.get("date"):
+                    _take_offered_slot(st, text)
                 prior_slots = dict(st.slots)
                 changed = merge_slots(st, slots)
                 if st.hold_token and {"doctor_name", "date", "time_slot"} & set(changed):
@@ -2866,8 +2899,36 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str, early: early_
                     spelled = merge_spelling(st, slots["spelled_letters"])
                     if spelled:
                         st.slots["patient_name"] = spelled.capitalize()
+                        st.name_confirmed = True  # spelled out letter by letter: already certain
                         await _speak(session, spelling_readback(spelled, lang), lang)
                         return
+
+                # "Patient name is misheard": only one decoder produced this turn, so nothing
+                # vouches for the name it carried. Read it back NOW rather than at the final
+                # readback -- a wrong name caught here costs one yes/no; caught at the end it
+                # costs the caller every question they answered under it.
+                if "patient_name" in changed and not st.name_confirmed and confidence != VERIFIED:
+                    session.awaiting_name_confirm = True
+                    await _speak(
+                        session,
+                        entity_text.confirm_question("patient_name", st.slots["patient_name"], lang),
+                        lang,
+                    )
+                    return
+
+                # Doctor known, day not: offer when the doctor next sits (or the soonest slot,
+                # if that is what was asked for) rather than asking the caller to guess a date.
+                # Only at the OPENING of the booking, or when the caller explicitly asks for the
+                # soonest slot. Re-offering a day in the middle of a conversation that is already
+                # collecting details is not this story and would talk over the caller.
+                if (
+                    st.slots.get("doctor_name")
+                    and not st.slots.get("date")
+                    and not st.offered_slots
+                    and (not st.asked_fields or earliest_request.wants_earliest(text, lang))
+                    and await _offer_days_or_slots(session, st, text, lang)
+                ):
+                    return
 
                 missing = missing_required(st)
                 if missing:
@@ -3014,6 +3075,179 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str, early: early_
             await _speak(session, phrase("tool_failure", lang), lang, fallback_reason="tool_failure")
 
 
+# story: "Caller names only a doctor"
+# story: "Caller asks for the earliest available appointment"
+# story: "Requested slot is already taken"
+def _remember_offer(st, slots: list[dict]) -> None:
+    st.offered_slots = list(slots)
+
+
+# story: "Caller names only a doctor"
+# story: "Caller asks for the earliest available appointment"
+async def _offer_days_or_slots(session: CallSession, st, text: str, lang: str) -> bool:
+    """A doctor is known and no day is. Offer instead of asking.
+
+    Asked for the soonest ("Caller asks for the earliest available appointment") -> the first free
+    slot with its day and time, plus the next alternatives. Otherwise ("Caller names only a
+    doctor") -> confirm the doctor and say when they next sit, so the caller is not guessing dates.
+
+    Availability is read live on every ask, never cached: another caller can take a slot between
+    two questions. Returns True when the turn has been answered.
+
+    Any tool failure returns False and the ordinary "which day?" question is asked -- an offer is
+    a convenience, and losing it must never cost the caller their booking."""
+    doctor = st.slots.get("doctor_name")
+    earliest = earliest_request.wants_earliest(text, lang)
+    try:
+        result = (
+            await _tools.doctor_earliest(doctor)
+            if earliest
+            else await _tools.get_doctor_availability(doctor, None)
+        )
+    except ToolCallError as e:
+        logger.warning("[%s] slot offer unavailable (%s) -- asking for the day instead", session.call_id, e)
+        return False
+    if not result.get("found"):
+        return False
+
+    if earliest:
+        if not result.get("available"):
+            # Never a bare refusal (E12-S5): a call when a slot opens, through the callback flow
+            # this tree already has. A person makes that call -- nothing here watches for a
+            # cancellation, so nothing promises an automatic one.
+            known = session.identity.phone or st.slots.get("contact_phone") or st.slots.get("phone")
+            if not CALLBACKS_ENABLED:
+                await _speak(session, earliest_none_prompt(result, lang, offer_callback=False), lang)
+                return True
+            await _speak(session, earliest_none_prompt(result, lang, offer_callback=not known), lang)
+            if known:
+                await _queue_callback_request(session, known, lang)
+            else:
+                session.awaiting_callback_phone = True
+            return True
+        offered = [{"date": result["date"], "time_slot": result["time_slot"]}]
+        offered += [{"date": result["date"], "time_slot": t} for t in (result.get("alternatives") or [])]
+        _remember_offer(st, offered)
+        await _speak(session, earliest_slots_prompt(result, lang), lang)
+        return True
+
+    next_date = result.get("next_available_date") or result.get("date")
+    ask_time = not st.slots.get("time_slot")
+    if not next_date:
+        await _speak(session, doctor_offer_prompt(result, lang, ask_time), lang)
+        return True
+    _remember_offer(st, [{"date": next_date, "time_slot": ""}])
+    # The offer IS the grouped day+time question (slot_grouping's pairing for this action), so
+    # the caller is not asked the day twice.
+    st.asked_fields.update({"date", "time_slot"} if ask_time else {"date"})
+    await _speak(session, doctor_offer_prompt(result, lang, ask_time), lang)
+    return True
+
+
+# story: "Caller names only a doctor"
+# story: "Caller asks for the earliest available appointment"
+# story: "Requested slot is already taken"
+def _take_offered_slot(st, text: str) -> bool:
+    """The caller picked one of the slots just read out. Fills the day (and the time, when the
+    offer named one) and clears the offer. False when they said something else -- a day of their
+    own, a question -- which is then handled normally."""
+    chosen = pick_offered_slot(text, st.offered_slots) if st.offered_slots else None
+    if chosen is None:
+        return False
+    st.slots["date"] = chosen["date"]
+    if chosen.get("time_slot"):
+        st.slots["time_slot"] = chosen["time_slot"]
+    st.offered_slots = []
+    st.touch()
+    return True
+
+
+# story: "Caller says tomorrow, day after, or next Monday"
+async def _confirm_spoken_date(session: CallSession, intent: str, slots: dict, text: str, lang: str) -> bool:
+    """Read the date back before the lookup runs. True when the turn has been answered by a
+    question instead of an answer.
+
+    The model resolves a relative word to a calendar date on its own (agent/llm.py). This
+    compares that against what THIS language's cue table makes of the same words
+    (agent/date_check.py) and puts the result to the caller: one date is read back for a yes,
+    two readings are offered for a choice. Nothing is looked up until they have heard the day.
+
+    Dates the caller stated outright are read back too -- "the resolved absolute date is ALWAYS
+    read back before use" is the criterion, and a misheard "15th" is as wrong as a misread
+    "tomorrow"."""
+    if session.booking is not None:
+        return False  # a booking reads its whole slate back at the end; one question is enough
+    verdict = date_check.check(text, slots.get("date"), lang)
+    if verdict.action == date_check.ABSENT:
+        return False
+    if verdict.action == date_check.ASK:
+        session.pending_dated_enquiry = (intent, dict(slots), None)
+        await _speak(session, date_ask_prompt(verdict.candidates, lang), lang)
+        return True
+    session.pending_dated_enquiry = (intent, dict(slots), verdict.date)
+    await _speak(session, date_check_prompt(verdict.date, verdict.said, lang), lang)
+    return True
+
+
+# story: "Caller says tomorrow, day after, or next Monday"
+async def _continue_dated_enquiry(session: CallSession, text: str, lang: str) -> bool:
+    """The caller's answer to "<date>. Is that right?" (or to the two-date question)."""
+    intent, slots, offered = session.pending_dated_enquiry
+    session.pending_dated_enquiry = None
+    answer = classify_yes_no(text, lang)
+    settled = offered if answer == "yes" else None
+    if settled is None:
+        # Either they said no, or they named a day instead of answering. Re-read whatever this
+        # turn says; a day given now is confirmed in its turn, never used straight away.
+        again = date_check.check(text, None, lang)
+        if again.action == date_check.CONFIRM:
+            session.pending_dated_enquiry = (intent, slots, again.date)
+            await _speak(session, date_check_prompt(again.date, again.said, lang), lang)
+            return True
+        if answer == "no":
+            await _speak(session, missing_slot_prompt(intent, "date", lang), lang)
+            return True
+        return False  # not an answer to this question: handle the turn normally
+    slots = {**slots, "date": settled}
+    reply = await _answer_enquiry_intent(intent, slots, lang)
+    if reply is None:
+        await _speak(session, missing_slot_prompt(intent, "doctor_name", lang), lang)
+        return True
+    await _speak(session, reply, lang)
+    return True
+
+
+# story: "Patient name is misheard"
+async def _continue_name_confirm(session: CallSession, text: str, lang: str) -> bool:
+    """The answer to "do you mean <name>?", asked because only one decoder produced that name.
+
+    A no does NOT ask the same question again -- a name the recogniser misheard once it will
+    mishear again. It drops the name and moves to spelling, which is the whole point of the
+    story. Anything that is neither yes nor no is treated as the caller simply saying the name
+    again, so the turn is handled normally and the new name replaces the old one."""
+    session.awaiting_name_confirm = False
+    st = session.booking
+    if st is None:
+        return False
+    answer = classify_yes_no(text, lang)
+    if answer == "yes":
+        st.name_confirmed = True
+        missing = missing_required(st)
+        if missing:
+            await _speak(session, _next_question(session, st, st.action, missing, lang), lang)
+        else:
+            mark_confirming(st)
+            await _speak(session, booking_confirmation_readback(st.slots, st.action, lang), lang)
+        return True
+    if answer == "no":
+        st.slots.pop("patient_name", None)
+        st.slots.pop("_spelling_buffer", None)
+        st.name_confirmed = False
+        await _speak(session, spelling_prompt(lang), lang)
+        return True
+    return False  # not an answer: let the turn be handled as a fresh one
+
+
 async def _reopen_after_no(session: CallSession, st, lang: str) -> None:
     """The caller refused the confirmation and gave nothing to change: collection reopens, the details captured
     stay, and the first question is asked again (KCD-367)."""
@@ -3033,9 +3267,42 @@ def _followup(session: CallSession, intent: str, slots: dict, text: str, lang: s
     return resolve_followup_slot(intent, slots, text, lang, session.last_enquiry_entities, gap)
 
 
+# story: "Caller cannot give a contact number"
+def _absorb_phone_digits(st, slots: dict) -> None:
+    """Keep a number the caller is still reading out, instead of storing a fragment as THE number.
+
+    The model reports whatever digits it heard this turn. A caller on someone else's phone often
+    reads a number in groups, so "nine eight seven" used to be stored as the contact number and
+    sail through missing_required into the readback. Now a fragment goes into the running buffer
+    (agent/booking_flow.merge_digits) and the field stays unfilled, so _next_question asks for the
+    rest with what they already gave kept. A whole number clears the buffer and is used as-is.
+
+    Mutates `slots` in place, before merge_slots sees it."""
+    for field in ("phone", "contact_phone"):
+        value = slots.get(field)
+        if not value:
+            continue
+        whole = normalise_phone(value)
+        if whole:
+            slots[field] = whole
+            st.slots.pop("_phone_buffer", None)
+            continue
+        slots.pop(field)
+        completed = merge_digits(st, value)
+        if completed:
+            slots[field] = completed
+
+
 def _next_question(session: CallSession, st, intent: str, missing: list[str], lang: str) -> str:
     """KCD-103: the next question, one field or a group. The caller-state table (`questions_per_turn`) always wins
     over grouping, and a field already asked is asked alone (agent/slot_grouping.py)."""
+    # A number arriving in pieces is continued, never restarted: asking "give me a phone number"
+    # again after the caller has already read out half of it loses the half they gave.
+    if missing and missing[0] == "phone":
+        so_far = phone_digits_so_far(st)
+        if so_far:
+            st.asked_fields.add("phone")
+            return phone_continue_prompt(so_far, lang)
     fields = slot_grouping.next_fields(st.action, missing, session.policy.questions_per_turn, st.asked_fields)
     grouped = slot_grouping.grouped_prompt(fields, lang) if len(fields) > 1 else None
     if grouped is None:

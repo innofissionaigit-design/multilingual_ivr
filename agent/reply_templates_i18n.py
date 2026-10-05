@@ -14,9 +14,39 @@ never a name in a script the TTS would silently drop.
 
 from __future__ import annotations
 
+import datetime
 import re
 
 from agent.sample_wording import sample_sentence
+
+# The day of the week, per language. Shared by every reply that names a date the agent WORKED OUT
+# rather than the caller stated -- the earliest-slot offer, an alternative on another day, and the
+# "আগামীকাল মানে মঙ্গলবার" check. Monday first, matching datetime.date.weekday().
+WEEKDAY_WORDS: dict[str, tuple[str, ...]] = {
+    "bn": ("সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার", "শুক্রবার", "শনিবার", "রবিবার"),
+    "hi": ("सोमवार", "मंगलवार", "बुधवार", "गुरुवार", "शुक्रवार", "शनिवार", "रविवार"),
+    "en": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+}
+
+
+# story: "Caller says tomorrow, day after, or next Monday"
+# story: "Caller asks for the earliest available appointment"
+def weekday_word(date_iso: str | None, lang: str = "bn") -> str:
+    """"মঙ্গলবার" for "2026-09-22". Worked out from the date the API returned -- no clock involved,
+    so it cannot drift from the date it labels. An unparseable date names no day rather than
+    guessing one."""
+    try:
+        index = datetime.date.fromisoformat(date_iso).weekday()
+    except (TypeError, ValueError):
+        return ""
+    return WEEKDAY_WORDS.get(lang, WEEKDAY_WORDS["bn"])[index]
+
+
+def spoken_day(date_iso: str | None, lang: str = "bn") -> str:
+    """A date with its weekday in front -- "মঙ্গলবার, 2026-09-22". The ISO date is left as data for
+    speech_norm.verbalize() to speak; only the day name is added here."""
+    day = weekday_word(date_iso, lang)
+    return f"{day}, {date_iso}" if day else str(date_iso or "")
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _LATIN = re.compile(r"[A-Za-z]")
@@ -281,6 +311,148 @@ def clinic_faq_reply(slots: dict, result: dict, lang: str) -> str:
     return result.get("answer") or fallback
 
 
+# story: "Caller says tomorrow, day after, or next Monday"
+def date_check_prompt(date_iso: str, said: str | None, lang: str) -> str:
+    """See reply_templates.date_check_prompt."""
+    hi = lang == "hi"
+    spoken = spoken_day(date_iso, lang)
+    if hi:
+        head = f"{said} मतलब {spoken}" if said else spoken
+        return f"{head}। सही है?"
+    head = f"{said} means {spoken}" if said else spoken
+    return f"{head}. Is that right?"
+
+
+# story: "Caller says tomorrow, day after, or next Monday"
+def date_ask_prompt(candidates, lang: str) -> str:
+    """See reply_templates.date_ask_prompt."""
+    hi = lang == "hi"
+    days = [spoken_day(d, lang) for d in list(candidates)[:2]]
+    if len(days) < 2:
+        if not days:
+            return "किस तारीख की बात कर रहे हैं?" if hi else "Which date do you mean?"
+        return (
+            f"क्या आप {days[0]} की बात कर रहे हैं, या कोई और दिन?"
+            if hi
+            else f"Do you mean {days[0]}, or another day?"
+        )
+    return (
+        f"क्या आप {days[0]} की बात कर रहे हैं, या {days[1]} की?"
+        if hi
+        else f"Do you mean {days[0]}, or {days[1]}?"
+    )
+
+
+# story: "Caller names only a doctor"
+def doctor_offer_prompt(result: dict, lang: str, ask_time: bool = False) -> str:
+    """See reply_templates.doctor_offer_prompt."""
+    hi = lang == "hi"
+    doctor = _doctor_name({}, result, lang)
+    next_date = result.get("next_available_date") or result.get("date")
+    if not next_date:
+        return (
+            f"{doctor} अगले दो हफ़्तों में नहीं बैठ रहे। किसी और डॉक्टर के बारे में बताऊँ?"
+            if hi
+            else f"{doctor} has no sitting in the next two weeks. Shall I tell you about another doctor?"
+        )
+    hours = result.get("chamber_hours")
+    day = spoken_day(next_date, lang)
+    if hi:
+        hours_clause = f", चैंबर का समय {hours}" if hours else ""
+        time_clause = " और किस समय?" if ask_time else ""
+        return (
+            f"जी हाँ, {doctor}। उनका अगला दिन {day} है{hours_clause}। "
+            f"उसी दिन बुक करूँ, या कोई और दिन?{time_clause}"
+        )
+    hours_clause = f", in the chamber {hours}" if hours else ""
+    time_clause = " And what time?" if ask_time else ""
+    return (
+        f"Yes, {doctor}. Their next sitting is {day}{hours_clause}. "
+        f"Shall I book that day, or another day?{time_clause}"
+    )
+
+
+# story: "Caller asks for the earliest available appointment"
+def earliest_slots_prompt(result: dict, lang: str) -> str:
+    """See reply_templates.earliest_slots_prompt."""
+    hi = lang == "hi"
+    doctor = _doctor_name({}, result, lang)
+    day = spoken_day(result.get("date"), lang)
+    time_slot = result.get("time_slot")
+    alternatives = result.get("alternatives") or []
+    # Short sentences on purpose -- see reply_templates.earliest_slots_prompt.
+    if hi:
+        more = f" उसी दिन {' और '.join(alternatives)} भी खाली है।" if alternatives else ""
+        choose = "कौन सा बुक करूँ, पहला या दूसरा?" if len(alternatives) == 1 else (
+            "कौन सा बुक करूँ, पहला, दूसरा या तीसरा?" if alternatives else "क्या वही बुक कर दूँ?"
+        )
+        return (
+            f"{doctor} सबसे पहले {day} को बैठेंगे। {time_slot} खाली है।{more} "
+            f"{choose} कोई और दिन चाहिए तो बताइए।"
+        )
+    more = f" That day {' and '.join(alternatives)} are also free." if alternatives else ""
+    choose = "Which one shall I book, the first or the second?" if len(alternatives) == 1 else (
+        "Which one shall I book, the first, the second or the third?" if alternatives else "Shall I book that one?"
+    )
+    return (
+        f"{doctor} is next in on {day}. {time_slot} is free.{more} "
+        f"{choose} You can also name another day."
+    )
+
+
+# story: "Caller asks for the earliest available appointment"
+def earliest_none_prompt(result: dict, lang: str, offer_callback: bool = True) -> str:
+    """See reply_templates.earliest_none_prompt."""
+    hi = lang == "hi"
+    doctor = _doctor_name({}, result, lang)
+    if not offer_callback:
+        return (
+            f"{doctor} के पास अगले दो हफ़्तों में कोई खाली समय नहीं है। आप काउंटर से संपर्क कर सकते हैं।"
+            if hi
+            else f"{doctor} has no free time in the next two weeks. You can contact the counter."
+        )
+    return (
+        f"{doctor} के पास अगले दो हफ़्तों में कोई खाली समय नहीं है। समय खाली होने पर क्लिनिक से कोई "
+        f"आपको फ़ोन कर सकता है। उसके लिए एक फ़ोन नंबर बताइए?"
+        if hi
+        else f"{doctor} has no free time in the next two weeks. When a time opens, someone from "
+        f"the clinic can call you. Could you give me a phone number for that?"
+    )
+
+
+# story: "Requested slot is already taken"
+def slot_taken_reply(slots: dict, result: dict, lang: str) -> str:
+    """See reply_templates.slot_taken_reply. The other-day alternative NAMES its day: it is not
+    the day the caller asked about, and offering it as a bare time let them accept a slot on a day
+    they never agreed to."""
+    hi = lang == "hi"
+    alts = result.get("alternative_slots") or []
+    other = result.get("other_day_slot") or {}
+    parts = []
+    if alts:
+        joined = " या ".join(alts) if hi else " or ".join(alts)
+        parts.append(f"उस दिन {joined} खाली है" if hi else f"that day {joined} is free")
+    if other.get("date"):
+        day = spoken_day(other["date"], lang)
+        parts.append(
+            f"{day} को उसी समय {other['time_slot']} खाली है"
+            if hi
+            else f"{day} at the same time, {other['time_slot']}, is free"
+        )
+    if not parts:
+        return (
+            "वह समय बुक हो चुका है, और आसपास कोई समय खाली नहीं है।"
+            if hi
+            else "That time is already booked, and nothing nearby is free."
+        )
+    joined = ", या ".join(parts) if hi else ", or ".join(parts)
+    return (
+        f"वह समय बुक हो चुका है, लेकिन {joined}। कौन सा बुक करूँ?"
+        if hi
+        else f"That time is already booked, but {joined}. Which one shall I book?"
+    )
+
+
 def booking_reply(slots: dict, result: dict, lang: str) -> str:
     hi = lang == "hi"
     if result.get("success"):
@@ -297,18 +469,7 @@ def booking_reply(slots: dict, result: dict, lang: str) -> str:
 
     reason = result.get("reason")
     if reason == "slot_taken":
-        alts = result.get("alternative_slots") or []
-        if alts:
-            return (
-                f"वह समय बुक हो चुका है। ये समय खाली हैं: {', '.join(alts)}। कौन सा चाहिए?"
-                if hi
-                else f"That time is already booked. These times are free: {', '.join(alts)}. Which one would you like?"
-            )
-        return (
-            "वह समय बुक हो चुका है, और आसपास कोई समय खाली नहीं है।"
-            if hi
-            else "That time is already booked, and nothing nearby is free."
-        )
+        return slot_taken_reply(slots, result, lang)
     if reason == "doctor_ambiguous":
         names = result.get("did_you_mean_hi" if hi else "did_you_mean") or result.get("did_you_mean") or []
         if hi:
@@ -358,6 +519,19 @@ def booking_reply(slots: dict, result: dict, lang: str) -> str:
     )
 
 
+# story: "Caller cannot give a contact number"
+def phone_continue_prompt(so_far: str, lang: str) -> str:
+    """See reply_templates.phone_continue_prompt."""
+    spelled = " ".join(so_far)
+    return (
+        f"अभी तक {spelled} मिला है। बाकी अंक बताइए?"
+        if lang == "hi"
+        else f"So far I have {spelled}. Could you give me the rest of the number?"
+    )
+
+
+# story: "Caller gives everything in one sentence"
+# story: "Patient name is misheard"
 def booking_confirmation_readback(slots: dict, action: str, lang: str) -> str:
     hi = lang == "hi"
     if action == "book_appointment":
@@ -399,6 +573,7 @@ def booking_confirmation_readback(slots: dict, action: str, lang: str) -> str:
     return "क्या यह कन्फ़र्म कर दूँ?" if hi else "Shall I confirm this?"
 
 
+# story: "Caller moves an existing appointment"
 def reschedule_reply(result: dict, lang: str) -> str:
     hi = lang == "hi"
     if result.get("success"):
@@ -438,28 +613,59 @@ def reschedule_reply(result: dict, lang: str) -> str:
     )
 
 
+# story: "Caller cancels an appointment"
+def refund_sentence(result: dict, lang: str) -> str:
+    """Refund ELIGIBILITY in words, never an amount -- see reply_templates.refund_sentence."""
+    hi = lang == "hi"
+    eligibility = result.get("refund_eligibility")
+    if eligibility == "full":
+        return "नियम के अनुसार आप पूरे रिफ़ंड के हक़दार हैं।" if hi else "Under the policy you are eligible for a full refund."
+    if eligibility == "partial" and result.get("refund_percent"):
+        percent = result["refund_percent"]
+        return (
+            f"नियम के अनुसार आप {percent} प्रतिशत रिफ़ंड के हक़दार हैं।"
+            if hi
+            else f"Under the policy you are eligible for a {percent} percent refund."
+        )
+    if eligibility == "none":
+        return "नियम के अनुसार इस पर कोई रिफ़ंड नहीं मिलेगा।" if hi else "Under the policy no refund applies in this case."
+    return ""
+
+
+def _with_refund(line: str, result: dict, lang: str) -> str:
+    refund = refund_sentence(result, lang)
+    return f"{line} {refund}" if refund else line
+
+
 def cancel_reply(result: dict, lang: str) -> str:
     hi = lang == "hi"
     reason = result.get("reason")
     if reason == "charge_confirmation_required":
         charge = result["charge_inr"]
-        return (
-            f"इस समय रद्द करने पर {charge} रुपये कटेंगे। फिर भी रद्द कर दूँ?"
+        stated = _with_refund(
+            f"इस समय रद्द करने पर {charge} रुपये कटेंगे।"
             if hi
-            else f"Cancelling now means a charge of {charge} rupees. Shall I still cancel it?"
+            else f"Cancelling now means a charge of {charge} rupees.",
+            result,
+            lang,
         )
+        return f"{stated} फिर भी रद्द कर दूँ?" if hi else f"{stated} Shall I still cancel it?"
     if result.get("success"):
         charge = result.get("charge_inr") or 0
         if charge:
-            return (
+            return _with_refund(
                 f"आपकी अपॉइंटमेंट रद्द कर दी गई है। {charge} रुपये काटे गए हैं।"
                 if hi
-                else f"Your appointment has been cancelled. A charge of {charge} rupees has been applied."
+                else f"Your appointment has been cancelled. A charge of {charge} rupees has been applied.",
+                result,
+                lang,
             )
-        return (
+        return _with_refund(
             "आपकी अपॉइंटमेंट बिना किसी शुल्क के रद्द कर दी गई है।"
             if hi
-            else "Your appointment has been cancelled with no charge."
+            else "Your appointment has been cancelled with no charge.",
+            result,
+            lang,
         )
     if reason == "not_found":
         return (
@@ -656,6 +862,7 @@ def conflict_reply(conflict: dict, lang: str) -> str:
     )
 
 
+# story: "Caller asks for the earliest available appointment"
 def earliest_available_reply(result: dict, lang: str) -> str:
     hi = lang == "hi"
     if not result.get("found"):
@@ -691,6 +898,7 @@ def draft_resume_reply(draft: dict, lang: str) -> str:
     )
 
 
+# story: "Patient name is misheard"
 def spelling_prompt(lang: str) -> str:
     hi = lang == "hi"
     return "नाम एक-एक अक्षर करके बताएँगे?" if hi else "Could you spell the name out for me, letter by letter?"
